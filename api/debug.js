@@ -1,30 +1,24 @@
-const db = require('./_lib/supabase');
+function cleanUrl(raw) {
+  if (!raw) return '';
+  try {
+    const u = new URL(raw.trim());
+    return u.origin;
+  } catch (e) {
+    return raw.trim().replace(/\/+$/, '');
+  }
+}
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  const url = process.env.SUPABASE_URL || 'NOT SET';
-  const key = process.env.SUPABASE_SERVICE_KEY || 'NOT SET';
+  const rawUrl = process.env.SUPABASE_URL || 'NOT SET';
+  const cleanedUrl = cleanUrl(rawUrl);
+  const key = (process.env.SUPABASE_SERVICE_KEY || '').trim();
 
   let testResult = {};
 
   try {
-    // 1. Direct fetch root rest/v1/
-    const rRoot = await fetch(`${url.replace(/\/$/, '')}/rest/v1/`, {
-      headers: {
-        'apikey': key,
-        'Authorization': `Bearer ${key}`
-      }
-    });
-    testResult.root_status = rRoot.status;
-    testResult.root_text = (await rRoot.text()).substring(0, 200);
-  } catch (e) {
-    testResult.root_error = e.message;
-  }
-
-  try {
-    // 2. Direct fetch users table
-    const rUsers = await fetch(`${url.replace(/\/$/, '')}/rest/v1/users?select=*`, {
+    const rUsers = await fetch(`${cleanedUrl}/rest/v1/users?select=*`, {
       headers: {
         'apikey': key,
         'Authorization': `Bearer ${key}`
@@ -37,7 +31,8 @@ module.exports = async function handler(req, res) {
   }
 
   return res.json({
-    env_SUPABASE_URL: url,
+    raw_env_SUPABASE_URL: rawUrl,
+    cleaned_SUPABASE_URL: cleanedUrl,
     key_prefix: key.substring(0, 10),
     testResult
   });

@@ -1,8 +1,17 @@
 const { requireAuth } = require('../../_lib/auth');
-const db = require('../../_lib/supabase');
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
+function cleanUrl(raw) {
+  if (!raw) return '';
+  try {
+    const u = new URL(raw.trim());
+    return u.origin;
+  } catch (e) {
+    return raw.trim().replace(/\/+$/, '');
+  }
+}
+
+const SUPABASE_URL = cleanUrl(process.env.SUPABASE_URL);
+const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_KEY || '').trim();
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
