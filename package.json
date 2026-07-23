@@ -1,0 +1,14 @@
+{
+  "name": "khata-scan",
+  "version": "1.0.0",
+  "description": "Khata Scan — Invoice se Ledger tak, powered by Supabase + Vercel",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
+  }
+}

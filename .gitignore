@@ -1,0 +1,18 @@
+# Environment variables — NEVER commit this file!
+.env
+.env.local
+.env.production
+
+# Dependencies
+node_modules/
+
+# Vercel
+.vercel/
+
+# Old SQLite backend (no longer used)
+khata-scan-app/data/
+khata-scan-app/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
