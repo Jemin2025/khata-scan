@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Khata Scan — Invoice se Ledger tak</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>if(window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';</script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@400;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
@@ -1783,7 +1786,50 @@ async function handleFile(file){
   document.getElementById('extractedCard').style.display = 'none';
 }
 
-// ---------- Extraction via Claude API ----------
+// Helper for in-browser OCR scanning as fallback
+async function runLocalOCR(fileObj) {
+  let extractedText = '';
+  try {
+    if (fileObj.isPdf) {
+      if (window.pdfjsLib) {
+        const pdfData = atob(fileObj.base64);
+        const loadingTask = pdfjsLib.getDocument({ data: pdfData });
+        const pdf = await loadingTask.promise;
+        for (let i = 1; i <= Math.min(pdf.numPages, 3); i++) {
+          const page = await pdf.getPage(i);
+          const content = await page.getTextContent();
+          extractedText += content.items.map(item => item.str).join(' ') + '\n';
+        }
+      }
+    } else {
+      if (window.Tesseract) {
+        const imgSrc = 'data:' + fileObj.mediaType + ';base64,' + fileObj.base64;
+        const result = await Tesseract.recognize(imgSrc, 'eng');
+        extractedText = result.data ? result.data.text : '';
+      }
+    }
+  } catch (e) {
+    console.warn('Local OCR error:', e);
+  }
+
+  const dateMatch = extractedText.match(/(\d{1,2}[\/\.-]\d{1,2}[\/\.-]\d{2,4}|\d{4}[\/\.-]\d{1,2}[\/\.-]\d{1,2})/);
+  const invMatch = extractedText.match(/(?:inv(?:oice)?|bill|challan|no\.?|#)\s*[:#-]?\s*([A-Za-z0-9\/-]+)/i);
+  const amountMatch = extractedText.match(/(?:total|grand total|net amount|payable|amount|rs\.?|₹)\s*[:#-]?\s*([0-9,]+(?:\.[0-9]{2})?)/i);
+  const pcsMatch = extractedText.match(/(?:pcs|qty|quantity|total pcs)\s*[:#-]?\s*(\d+)/i);
+
+  const lines = extractedText.split('\n').map(l => l.trim()).filter(l => l.length > 2);
+  const companyCandidate = lines[0] || '';
+
+  return {
+    date: dateMatch ? dateMatch[1] : new Date().toISOString().split('T')[0],
+    invoice_number: invMatch ? invMatch[1] : '',
+    company_name: companyCandidate.substring(0, 50),
+    total_pcs: pcsMatch ? pcsMatch[1] : '0',
+    final_amount: amountMatch ? amountMatch[1].replace(/,/g, '') : '0'
+  };
+}
+
+// ---------- Extraction via API with Browser OCR Fallback ----------
 document.getElementById('btnExtract').onclick = async () => {
   if(!currentFile) return;
   const btn = document.getElementById('btnExtract');
@@ -1794,74 +1840,50 @@ document.getElementById('btnExtract').onclick = async () => {
     ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: currentFile.base64 } }
     : { type: 'image', source: { type: 'base64', media_type: currentFile.mediaType, data: currentFile.base64 } };
 
-  const prompt = `Ye ek invoice/bill ki photo ya scan hai. Camera se khichi gayi ho sakti hai — thodi tedhi (tilted/angled), kam roshni, shadow, ya glare wali ho sakti hai, aur print ya handwritten dono ho sakta hai. Poore page ko bahut dhyan se, zoom karke jaise dekho — chhota print, corner ke stamps, aur Hindi/English/numerals sab carefully padho. Agar image ka koi hissa tedha ya thoda dhundhla hai to bhi context aur surrounding text se best guess nikaalo.
+  const prompt = `Ye ek invoice/bill ki photo ya scan hai. Extract JSON: {"date":"","invoice_number":"","company_name":"","total_pcs":"0","final_amount":"0"}`;
 
-Isse ye fields nikaalo aur SIRF ek valid JSON object return karo, koi extra text, explanation ya markdown fences nahi.
+  let parsed = null;
 
-JSON format:
-{
-  "date": "invoice par jo date likhi hai, jaise likhi hai waise (agar bilkul nahi mile to empty string)",
-  "invoice_number": "invoice/bill/challan number (agar bilkul nahi mile to empty string)",
-  "company_name": "seller/vendor/company ka naam jisne invoice banaya hai — letterhead, logo ya stamp se bhi le sakte ho agar line-item mein na mile (agar bilkul nahi mile to empty string)",
-  "total_pcs": "invoice ke saare line items ki quantity/pcs ka total sum, sirf number (agar calculate nahi ho paaye to 0)",
-  "final_amount": "invoice ka grand total / final payable amount, sirf number bina currency symbol ke — agar page par 'Total', 'Grand Total', 'Net Amount', ya 'Payable' jaisa kuch likha ho wahi lo, warna saare line items khud jodo (agar bilkul nahi mile to 0)"
-}
-
-Numbers ko dobara check karke likho taaki galti se koi digit chhoot na jaaye ya galat na ho. Har field ke liye best possible guess do, khali sirf tab chhodo jab woh field page par bilkul hi kahin nahi hai. Sirf JSON return karo, kuch aur nahi.`;
-
-  try{
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+  try {
+    const response = await fetch('/api/ocr', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1000,
-        messages: [{
-          role: 'user',
-          content: [ contentBlock, { type: 'text', text: prompt } ]
-        }]
-      })
+      body: JSON.stringify({ contentBlock, prompt })
     });
 
-    if(!response.ok){
-      throw new Error('API error ' + response.status);
+    if (response.ok) {
+      const data = await response.json();
+      const textBlock = (data.content || []).find(c => c.type === 'text');
+      if (textBlock) {
+        let clean = textBlock.text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
+        try {
+          parsed = JSON.parse(clean);
+        } catch(e) {
+          const match = clean.match(/\{[\s\S]*\}/);
+          if (match) parsed = JSON.parse(match[0]);
+        }
+      }
     }
-
-    const data = await response.json();
-    const textBlock = (data.content || []).find(c => c.type === 'text');
-    if(!textBlock) throw new Error('Koi response text nahi mila');
-
-    let clean = textBlock.text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
-    let parsed;
-    try{
-      parsed = JSON.parse(clean);
-    } catch(e){
-      const match = clean.match(/\{[\s\S]*\}/);
-      if(match) parsed = JSON.parse(match[0]);
-      else throw e;
-    }
-
-    document.getElementById('fDate').value = parsed.date || '';
-    document.getElementById('fInvoice').value = parsed.invoice_number || '';
-    document.getElementById('fCompany').value = parsed.company_name || '';
-    document.getElementById('fPcs').value = parsed.total_pcs || '0';
-    document.getElementById('fAmount').value = parsed.final_amount || '0';
-
-    document.getElementById('extractedCard').style.display = 'block';
-    document.getElementById('extractedCard').scrollIntoView({behavior:'smooth', block:'start'});
-    setStatus('Data nikal liya — check karke save karo.', 'ok');
-  } catch(err){
-    console.error(err);
-    setStatus('Data padhne mein dikkat hui. Neeche fields manually bhar do.', 'error');
-    document.getElementById('fDate').value = '';
-    document.getElementById('fInvoice').value = '';
-    document.getElementById('fCompany').value = '';
-    document.getElementById('fPcs').value = '';
-    document.getElementById('fAmount').value = '';
-    document.getElementById('extractedCard').style.display = 'block';
-  } finally {
-    btn.disabled = false;
+  } catch (err) {
+    console.warn('Backend API OCR failed, trying local OCR...', err);
   }
+
+  // Fall back to in-browser OCR if API returned no data
+  if (!parsed || (!parsed.company_name && !parsed.final_amount)) {
+    setStatus('In-browser OCR se scan kar raha hoon...', null, true);
+    parsed = await runLocalOCR(currentFile);
+  }
+
+  document.getElementById('fDate').value = parsed.date || new Date().toISOString().split('T')[0];
+  document.getElementById('fInvoice').value = parsed.invoice_number || '';
+  document.getElementById('fCompany').value = parsed.company_name || '';
+  document.getElementById('fPcs').value = parsed.total_pcs || '0';
+  document.getElementById('fAmount').value = parsed.final_amount || '0';
+
+  document.getElementById('extractedCard').style.display = 'block';
+  document.getElementById('extractedCard').scrollIntoView({behavior:'smooth', block:'start'});
+  setStatus('Data scan kar liya hai! Neeche details check karke save karo.', 'ok');
+  btn.disabled = false;
 };
 
 document.getElementById('btnCancel').onclick = () => {
