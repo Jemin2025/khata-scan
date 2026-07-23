@@ -1,18 +1,16 @@
-// Instant Cloud JSON Store — 0-config, 0-SQL, 100% persistent backend
+// Cloud JSON Store — atomic read-modify-write with retry (works across serverless instances)
 const BLOB_URL = process.env.JSON_BLOB_URL || 'https://jsonblob.com/api/jsonBlob/019f8f39-4b3d-7db7-9ef8-527dc603a4a8';
+const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 200;
 
-// Lock helper to prevent race conditions during concurrent updates
-let lockPromise = Promise.resolve();
-
-function withLock(fn) {
-  const next = lockPromise.then(fn, fn);
-  lockPromise = next;
-  return next;
+function sleep(ms) {
+  return new Promise(res => setTimeout(res, ms));
 }
 
 async function getFullDb() {
   const res = await fetch(BLOB_URL, {
-    headers: { 'Accept': 'application/json' }
+    headers: { 'Accept': 'application/json' },
+    cache: 'no-store'
   });
   if (!res.ok) throw new Error(`Cloud DB fetch failed: ${res.status}`);
   const data = await res.json();
@@ -32,6 +30,25 @@ async function saveFullDb(data) {
   });
   if (!res.ok) throw new Error(`Cloud DB save failed: ${res.status}`);
   return true;
+}
+
+// Atomic read-modify-write with retry — works across multiple serverless instances
+async function atomicUpdate(mutateFn) {
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const fullDb = await getFullDb();
+      const result = mutateFn(fullDb);
+      await saveFullDb(fullDb);
+      return result;
+    } catch (err) {
+      if (attempt < MAX_RETRIES - 1) {
+        // Jitter to avoid thundering herd
+        await sleep(RETRY_DELAY_MS * (attempt + 1) + Math.random() * 100);
+      } else {
+        throw err;
+      }
+    }
+  }
 }
 
 const db = {
@@ -55,23 +72,18 @@ const db = {
 
   // INSERT row into table
   async insert(table, rowData) {
-    return withLock(async () => {
-      const fullDb = await getFullDb();
+    return atomicUpdate(fullDb => {
       if (!fullDb[table]) fullDb[table] = [];
-      
-      const newRow = { id: Date.now(), ...rowData };
+      const newRow = { id: Date.now() + Math.random(), ...rowData };
       fullDb[table].push(newRow);
-      await saveFullDb(fullDb);
       return newRow;
     });
   },
 
   // UPSERT row
   async upsert(table, rowData, matchKeys = ['user_id', 'key', 'shared']) {
-    return withLock(async () => {
-      const fullDb = await getFullDb();
+    return atomicUpdate(fullDb => {
       if (!fullDb[table]) fullDb[table] = [];
-
       const list = fullDb[table];
       const index = list.findIndex(r => {
         return matchKeys.every(k => String(r[k] ?? '') === String(rowData[k] ?? ''));
@@ -79,12 +91,10 @@ const db = {
 
       if (index >= 0) {
         list[index] = { ...list[index], ...rowData, updated_at: new Date().toISOString() };
-        await saveFullDb(fullDb);
         return list[index];
       } else {
-        const newRow = { id: Date.now(), ...rowData, updated_at: new Date().toISOString() };
+        const newRow = { id: Date.now() + Math.random(), ...rowData, updated_at: new Date().toISOString() };
         list.push(newRow);
-        await saveFullDb(fullDb);
         return newRow;
       }
     });
@@ -92,17 +102,14 @@ const db = {
 
   // DELETE rows matching filters
   async delete(table, filters = {}) {
-    return withLock(async () => {
-      const fullDb = await getFullDb();
+    return atomicUpdate(fullDb => {
       if (!fullDb[table]) return true;
-
       fullDb[table] = fullDb[table].filter(row => {
         for (const [k, v] of Object.entries(filters)) {
           if (String(row[k]) === String(v)) return false;
         }
         return true;
       });
-      await saveFullDb(fullDb);
       return true;
     });
   }

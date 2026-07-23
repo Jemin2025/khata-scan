@@ -264,17 +264,16 @@ h1{
   color:var(--ink);
 }
 .drawer-close{
-  background:rgba(168,58,50,0.1);
-  color:var(--stamp);
+  background:none;
   border:none;
-  border-radius:50%;
-  width:34px;height:34px;
-  display:flex;
-  align-items:center;
-  justify-content:center;
+  color:var(--stamp);
   font-size:16px;
   font-weight:700;
   cursor:pointer;
+  width:auto;
+  height:auto;
+  padding:0;
+  margin:0;
 }
 
 .drawer-nav{
@@ -313,20 +312,16 @@ h1{
   .menu-toggle-btn{
     display:inline-flex;
     align-items:center;
-    gap:6px;
-    background:rgba(255, 255, 255, 0.85);
-    backdrop-filter:blur(10px);
-    -webkit-backdrop-filter:blur(10px);
-    border:1px solid rgba(216, 207, 182, 0.9);
-    border-radius:10px;
-    padding:8px 14px;
+    background:none;
+    border:none;
+    color:var(--ink);
     font-size:14px;
     font-weight:700;
-    color:var(--ink);
     cursor:pointer;
-    box-shadow:0 2px 10px rgba(31,58,56,0.08);
-    margin-bottom:12px;
+    padding:0;
+    margin:0 0 12px 0;
   }
+  .logout-btn{display:none;}
 }
 
 
@@ -951,7 +946,11 @@ footer a{color:var(--gold);}
     <div class="eyebrow">Bahi Khata · Digital</div>
     <h1>Khata Scan</h1>
     <div class="tagline">Invoice khincho, bill-order likho, baaki sab yahin ho jayega.</div>
-    <button class="logout-btn" id="btnLogout">Logout</button>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <span id="syncStatus" style="font-size:12px;color:var(--muted);font-family:'IBM Plex Mono',monospace;"></span>
+      <button id="btnSyncNow" style="font-size:12px;padding:6px 12px;border-radius:8px;background:rgba(169,122,38,0.12);border:1px solid var(--gold);color:var(--gold);cursor:pointer;font-weight:600;">🔄 Sync Karo</button>
+      <button class="logout-btn" id="btnLogout">Logout</button>
+    </div>
   </header>
 
 
@@ -2079,11 +2078,15 @@ document.getElementById('chequeFields').style.display = 'none';
 
 // ---------- Storage ----------
 async function loadLedger(){
+  const syncEl = document.getElementById('syncStatus');
+  if(syncEl) syncEl.textContent = '🔄 Sync ho raha hai...';
   try{
     const res = await window.storage.get(STORAGE_KEY, false);
     ledger = res && res.value ? JSON.parse(res.value) : [];
+    if(syncEl) { syncEl.textContent = '✅ Sync ho gaya'; setTimeout(()=>{ syncEl.textContent=''; },2000); }
   } catch(e){
     ledger = [];
+    if(syncEl) syncEl.textContent = '⚠️ Offline';
   }
   renderLedger();
   renderHome();
@@ -2092,13 +2095,54 @@ async function loadLedger(){
 async function persistLedger(){
   try{
     await window.storage.set(STORAGE_KEY, JSON.stringify(ledger), false);
+    // After saving, re-fetch from server to confirm save succeeded
+    const res = await window.storage.get(STORAGE_KEY, false);
+    ledger = res && res.value ? JSON.parse(res.value) : ledger;
   } catch(e){
     console.error('Storage save failed', e);
   }
+  renderLedger();
   renderHome();
 }
 
+// Auto-sync: reload data when user comes back to the tab
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible'){
+    loadLedger();
+    if(typeof loadIncoming === 'function') loadIncoming();
+    if(typeof loadCheques === 'function') loadCheques();
+    if(typeof loadBillsOrders === 'function') loadBillsOrders();
+  }
+});
+
+// Auto-sync every 60 seconds
+setInterval(()=>{
+  if(document.visibilityState === 'visible'){
+    loadLedger();
+    if(typeof loadIncoming === 'function') loadIncoming();
+    if(typeof loadCheques === 'function') loadCheques();
+    if(typeof loadBillsOrders === 'function') loadBillsOrders();
+  }
+}, 60000);
+
+// Manual sync button
+document.getElementById('btnSyncNow').onclick = async () => {
+  const btn = document.getElementById('btnSyncNow');
+  btn.disabled = true;
+  btn.textContent = '🔄 Sync ho raha hai...';
+  await Promise.allSettled([
+    loadLedger(),
+    (typeof loadIncoming === 'function') ? loadIncoming() : Promise.resolve(),
+    (typeof loadManualCheques === 'function') ? loadManualCheques() : Promise.resolve(),
+    (typeof loadBillsOrders === 'function') ? loadBillsOrders() : Promise.resolve(),
+  ]);
+  btn.disabled = false;
+  btn.textContent = '🔄 Sync Karo';
+};
+
+
 document.getElementById('btnSave').onclick = async () => {
+
   const paymentMethod = document.getElementById('fPaymentMethod').value;
   const record = {
     id: 'inv_' + Date.now(),
@@ -2768,6 +2812,8 @@ document.getElementById('btnSsCancel').onclick = () => {
     renderOrders();
     syncHomeData();
   }
+  window.loadBillsOrders = loadBillsOrders; // expose globally for sync button
+
   async function saveBills(){
     try{ await window.storage.set('bills', JSON.stringify(bills), false); }
     catch(e){ console.error('bill save error', e); }
