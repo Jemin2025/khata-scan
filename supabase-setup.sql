@@ -1,9 +1,4 @@
--- ============================================================
--- Khata Scan — Supabase Database Setup
--- Supabase Dashboard → SQL Editor → New Query → paste this → Run
--- ============================================================
-
--- Users table (login accounts)
+-- 1. Users table
 CREATE TABLE IF NOT EXISTS users (
   id            BIGSERIAL PRIMARY KEY,
   username      TEXT UNIQUE NOT NULL,
@@ -11,34 +6,30 @@ CREATE TABLE IF NOT EXISTS users (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Storage table (all app data: ledger, bills, orders, incoming, cheques)
+-- 2. Storage table
 CREATE TABLE IF NOT EXISTS storage (
   id         BIGSERIAL PRIMARY KEY,
-  user_id    BIGINT,               -- NULL for shared rows
+  user_id    BIGINT,
   key        TEXT NOT NULL,
   shared     BOOLEAN NOT NULL DEFAULT FALSE,
   value      TEXT,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Index: one row per (user, key) for personal data
+-- 3. Indexes
 CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_personal
   ON storage(user_id, key, shared)
   WHERE shared = FALSE;
 
--- Index: one row per key globally for shared data
 CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_shared
   ON storage(key)
   WHERE shared = TRUE;
 
--- Row Level Security (RLS) — disable for service_role key access
--- (Our API uses service_role key, so RLS doesn't block us)
-ALTER TABLE users ENABLE ROW LEVEL SECURITY;
-ALTER TABLE storage ENABLE ROW LEVEL SECURITY;
+-- 4. Disable RLS so API has full access
+ALTER TABLE users DISABLE ROW LEVEL SECURITY;
+ALTER TABLE storage DISABLE ROW LEVEL SECURITY;
 
--- Allow service_role full access (already default, just being explicit)
-CREATE POLICY "service_role_all_users" ON users
-  FOR ALL USING (true);
-
-CREATE POLICY "service_role_all_storage" ON storage
-  FOR ALL USING (true);
+-- 5. Insert ready-made Account for Anjani (Password: anjani123)
+INSERT INTO users (username, password_hash)
+VALUES ('anjani', '$2a$10$D8ljgsW5loeHfg7xoY8GCOd5sYklvOdyZbquI.EXU9a8kWJArE9nG')
+ON CONFLICT (username) DO NOTHING;
