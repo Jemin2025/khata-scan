@@ -1,6 +1,11 @@
 // Direct Supabase REST API helper — no SDK needed
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
+let SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/\/$/, '');
+// If user accidentally included /rest/v1 in SUPABASE_URL, trim it
+if (SUPABASE_URL.endsWith('/rest/v1')) {
+  SUPABASE_URL = SUPABASE_URL.substring(0, SUPABASE_URL.length - '/rest/v1'.length);
+}
+
+const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_KEY || '').trim();
 
 function getHeaders() {
   return {
