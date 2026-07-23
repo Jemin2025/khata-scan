@@ -1,106 +1,149 @@
-// ═══════════════════════════════════════════════════════
-// Upstash Redis REST API — reliable, serverless-friendly
-// Free tier: 10,000 req/day — https://upstash.com
+// ═══════════════════════════════════════════════════════════════════════
+// Persistent cloud storage — works with Upstash Redis (recommended)
+// OR falls back to JSONBlob (no setup needed).
 //
-// Required env vars (add in Vercel Dashboard → Settings → Environment Variables):
-//   UPSTASH_REDIS_REST_URL   = https://YOUR-DB.upstash.io
-//   UPSTASH_REDIS_REST_TOKEN = YOUR_TOKEN
-// ═══════════════════════════════════════════════════════
+// Priority:
+//   1. Upstash Redis  → set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN
+//   2. JSONBlob       → set JSON_BLOB_URL  (default already hardcoded)
+// ═══════════════════════════════════════════════════════════════════════
 
 const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const BLOB_URL      = process.env.JSON_BLOB_URL
+  || 'https://jsonblob.com/api/jsonBlob/019f8f39-4b3d-7db7-9ef8-527dc603a4a8';
 
-// Fallback: if Upstash is not configured, use in-memory store (dev only)
-const memStore = {};
+const USE_UPSTASH = !!(UPSTASH_URL && UPSTASH_TOKEN);
 
-function isConfigured() {
-  return !!(UPSTASH_URL && UPSTASH_TOKEN);
+// ─── helpers ────────────────────────────────────────────────────────────
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function fetchWithRetry(url, opts = {}, maxTries = 4) {
+  for (let i = 0; i < maxTries; i++) {
+    try {
+      const res = await fetch(url, opts);
+      if (res.ok) return res;
+      // 5xx → retry; 4xx → throw immediately
+      if (res.status < 500) throw new Error(`HTTP ${res.status}`);
+      if (i < maxTries - 1) await sleep(300 * (i + 1));
+      else throw new Error(`HTTP ${res.status} after ${maxTries} tries`);
+    } catch (e) {
+      if (i < maxTries - 1) await sleep(300 * (i + 1));
+      else throw e;
+    }
+  }
 }
 
-// ─── Upstash REST helpers ──────────────────────────────
-async function kvGet(key) {
-  if (!isConfigured()) {
-    return memStore[key] !== undefined ? memStore[key] : null;
-  }
-  const res = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+// ─── Upstash REST helpers ────────────────────────────────────────────────
+
+async function upstashGet(key) {
+  const res = await fetchWithRetry(
+    `${UPSTASH_URL}/get/${encodeURIComponent(key)}`,
+    { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, cache: 'no-store' }
+  );
+  const json = await res.json();
+  return json.result; // null if missing
+}
+
+async function upstashSet(key, value) {
+  await fetchWithRetry(
+    `${UPSTASH_URL}/set/${encodeURIComponent(key)}`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(value)
+    }
+  );
+}
+
+async function upstashDel(key) {
+  await fetchWithRetry(
+    `${UPSTASH_URL}/del/${encodeURIComponent(key)}`,
+    { method: 'POST', headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } }
+  );
+}
+
+// ─── JSONBlob helpers ────────────────────────────────────────────────────
+
+async function blobGet() {
+  const res = await fetchWithRetry(BLOB_URL, {
+    headers: { Accept: 'application/json' },
     cache: 'no-store'
   });
-  if (!res.ok) throw new Error(`Upstash GET failed: ${res.status}`);
-  const json = await res.json();
-  return json.result; // null if key doesn't exist
+  const data = await res.json();
+  if (!data.users)   data.users   = [];
+  if (!data.storage) data.storage = [];
+  return data;
 }
 
-async function kvSet(key, value) {
-  if (!isConfigured()) {
-    memStore[key] = value;
-    return 'OK';
-  }
-  const res = await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${UPSTASH_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(value)
+async function blobPut(data) {
+  await fetchWithRetry(BLOB_URL, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(data)
   });
-  if (!res.ok) throw new Error(`Upstash SET failed: ${res.status}`);
-  return 'OK';
 }
 
-async function kvDel(key) {
-  if (!isConfigured()) {
-    delete memStore[key];
-    return 1;
+// Atomic read-modify-write for JSONBlob (needed because it's one big JSON)
+async function blobAtomicUpdate(mutateFn) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const db = await blobGet();
+      const result = mutateFn(db);
+      await blobPut(db);
+      return result;
+    } catch (e) {
+      if (attempt < 3) await sleep(400 * (attempt + 1) + Math.random() * 200);
+      else throw e;
+    }
   }
-  const res = await fetch(`${UPSTASH_URL}/del/${encodeURIComponent(key)}`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
-  });
-  if (!res.ok) throw new Error(`Upstash DEL failed: ${res.status}`);
-  return 1;
 }
 
-// ─── DB abstraction (same interface as before) ─────────
-// Instead of one big JSON blob, each row is stored as its own key:
-//   users:username:<name>        → user object
-//   users:id:<id>                → user object  
-//   storage:<userId>:<key>       → value string
-//   storage:shared:<key>         → shared value string
+// ─── Unified DB API ──────────────────────────────────────────────────────
 
 const db = {
-  // ── users ─────────────────────────────────────────────
+
   async selectOne(table, filters = {}) {
-    if (table === 'users') {
-      // Lookup by username (most common)
-      if (filters.username) {
-        const data = await kvGet(`users:username:${filters.username}`);
-        if (!data) return null;
-        const user = typeof data === 'string' ? JSON.parse(data) : data;
-        // Apply remaining filters
-        for (const [k, v] of Object.entries(filters)) {
-          if (String(user[k]) !== String(v)) return null;
+    if (USE_UPSTASH) {
+      // ── Upstash path ──
+      if (table === 'users') {
+        if (filters.username) {
+          const raw = await upstashGet(`users:u:${filters.username}`);
+          if (!raw) return null;
+          const user = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          // check remaining filters
+          for (const [k, v] of Object.entries(filters)) {
+            if (String(user[k]) !== String(v)) return null;
+          }
+          return user;
         }
-        return user;
+        if (filters.id) {
+          const raw = await upstashGet(`users:id:${filters.id}`);
+          if (!raw) return null;
+          return typeof raw === 'string' ? JSON.parse(raw) : raw;
+        }
       }
-      // Lookup by id
-      if (filters.id) {
-        const data = await kvGet(`users:id:${filters.id}`);
-        if (!data) return null;
-        return typeof data === 'string' ? JSON.parse(data) : data;
+      if (table === 'storage') {
+        const { key, user_id, shared } = filters;
+        const isShared = shared === true || shared === 'true';
+        const storeKey = isShared ? `s:shared:${key}` : `s:${user_id}:${key}`;
+        const raw = await upstashGet(storeKey);
+        if (!raw) return null;
+        return typeof raw === 'string' ? JSON.parse(raw) : raw;
       }
+      return null;
+
+    } else {
+      // ── JSONBlob path ──
+      const fullDb = await blobGet();
+      const list = fullDb[table] || [];
+      return list.find(row => {
+        for (const [k, v] of Object.entries(filters)) {
+          if (String(row[k]) !== String(v)) return false;
+        }
+        return true;
+      }) || null;
     }
-    // storage table
-    if (table === 'storage') {
-      const { key, user_id, shared } = filters;
-      const storeKey = shared === true || shared === 'true'
-        ? `storage:shared:${key}`
-        : `storage:${user_id}:${key}`;
-      const data = await kvGet(storeKey);
-      if (!data) return null;
-      return typeof data === 'string' ? JSON.parse(data) : data;
-    }
-    return null;
   },
 
   async select(table, filters = {}) {
@@ -109,56 +152,84 @@ const db = {
   },
 
   async insert(table, rowData) {
-    if (table === 'users') {
-      const newUser = { id: Date.now(), ...rowData };
-      const payload = JSON.stringify(newUser);
-      await kvSet(`users:username:${newUser.username}`, payload);
-      await kvSet(`users:id:${newUser.id}`, payload);
-      return newUser;
+    const newRow = { id: Date.now(), ...rowData };
+
+    if (USE_UPSTASH) {
+      if (table === 'users') {
+        const payload = JSON.stringify(newRow);
+        await upstashSet(`users:u:${newRow.username}`, payload);
+        await upstashSet(`users:id:${newRow.id}`, payload);
+        return newRow;
+      }
+      throw new Error(`Upstash insert not supported for: ${table}`);
+    } else {
+      return blobAtomicUpdate(fullDb => {
+        if (!fullDb[table]) fullDb[table] = [];
+        fullDb[table].push(newRow);
+        return newRow;
+      });
     }
-    throw new Error(`insert not supported for table: ${table}`);
   },
 
   async upsert(table, rowData, matchKeys = []) {
-    if (table === 'storage') {
-      const { key, user_id, shared, value, ...rest } = rowData;
-      const isShared = shared === true || shared === 'true';
-      const storeKey = isShared
-        ? `storage:shared:${key}`
-        : `storage:${user_id}:${key}`;
-
-      const existing = await kvGet(storeKey);
-      const prev = existing
-        ? (typeof existing === 'string' ? JSON.parse(existing) : existing)
-        : {};
-
-      const updated = {
-        ...prev,
-        key,
-        shared: isShared,
-        user_id: isShared ? null : user_id,
-        value,
-        updated_at: new Date().toISOString()
-      };
-      await kvSet(storeKey, JSON.stringify(updated));
-      return updated;
+    if (USE_UPSTASH) {
+      if (table === 'storage') {
+        const { key, user_id, shared, value } = rowData;
+        const isShared = shared === true || shared === 'true' || shared === true;
+        const storeKey = isShared ? `s:shared:${key}` : `s:${user_id}:${key}`;
+        const updated = {
+          ...rowData,
+          shared: isShared,
+          user_id: isShared ? null : user_id,
+          updated_at: new Date().toISOString()
+        };
+        await upstashSet(storeKey, JSON.stringify(updated));
+        return updated;
+      }
+      throw new Error(`Upstash upsert not supported for: ${table}`);
+    } else {
+      return blobAtomicUpdate(fullDb => {
+        if (!fullDb[table]) fullDb[table] = [];
+        const list = fullDb[table];
+        const idx = list.findIndex(r =>
+          matchKeys.every(k => String(r[k] ?? '') === String(rowData[k] ?? ''))
+        );
+        if (idx >= 0) {
+          list[idx] = { ...list[idx], ...rowData, updated_at: new Date().toISOString() };
+          return list[idx];
+        } else {
+          const newRow = { id: Date.now(), ...rowData, updated_at: new Date().toISOString() };
+          list.push(newRow);
+          return newRow;
+        }
+      });
     }
-    throw new Error(`upsert not supported for table: ${table}`);
   },
 
   async delete(table, filters = {}) {
-    if (table === 'storage') {
-      const { key, user_id, shared } = filters;
-      const isShared = shared === true || shared === 'true';
-      const storeKey = isShared
-        ? `storage:shared:${key}`
-        : `storage:${user_id}:${key}`;
-      await kvDel(storeKey);
+    if (USE_UPSTASH) {
+      if (table === 'storage') {
+        const { key, user_id, shared } = filters;
+        const isShared = shared === true || shared === 'true';
+        const storeKey = isShared ? `s:shared:${key}` : `s:${user_id}:${key}`;
+        await upstashDel(storeKey);
+        return true;
+      }
       return true;
+    } else {
+      return blobAtomicUpdate(fullDb => {
+        if (!fullDb[table]) return true;
+        fullDb[table] = fullDb[table].filter(row => {
+          for (const [k, v] of Object.entries(filters)) {
+            if (String(row[k]) === String(v)) return false;
+          }
+          return true;
+        });
+        return true;
+      });
     }
-    return true;
   }
 };
 
 module.exports = db;
-module.exports.isConfigured = isConfigured;
+module.exports.isConfigured = () => USE_UPSTASH ? 'upstash' : 'jsonblob';

@@ -1563,19 +1563,42 @@ footer a{color:var(--gold);}
   }
 
   window.storage = {
+    // Returns null if key doesn't exist (404) — does NOT throw
     async get(key, shared){
-      const res = await apiFetch(`/api/storage/${encodeURIComponent(key)}?shared=${!!shared}`);
-      if(res.status === 404) throw new Error('Key not found: ' + key);
-      if(!res.ok) throw new Error('storage.get failed');
-      return res.json();
+      let lastErr;
+      for(let i = 0; i < 3; i++){
+        try{
+          const res = await apiFetch(`/api/storage/${encodeURIComponent(key)}?shared=${!!shared}`);
+          if(res.status === 404) return null;  // Key doesn't exist yet — return null, not error
+          if(!res.ok) throw new Error('storage.get HTTP ' + res.status);
+          return res.json();
+        } catch(e){
+          lastErr = e;
+          if(i < 2) await new Promise(r => setTimeout(r, 600 * (i + 1)));
+        }
+      }
+      throw lastErr;
     },
+    // Throws on failure so callers know save failed
     async set(key, value, shared){
-      const res = await apiFetch(`/api/storage/${encodeURIComponent(key)}`, {
-        method: 'POST',
-        body: JSON.stringify({ value, shared: !!shared })
-      });
-      if(!res.ok) return null;
-      return res.json();
+      let lastErr;
+      for(let i = 0; i < 3; i++){
+        try{
+          const res = await apiFetch(`/api/storage/${encodeURIComponent(key)}`, {
+            method: 'POST',
+            body: JSON.stringify({ value, shared: !!shared })
+          });
+          if(!res.ok){
+            const err = await res.json().catch(() => ({}));
+            throw new Error('storage.set failed: ' + (err.error || res.status));
+          }
+          return res.json();
+        } catch(e){
+          lastErr = e;
+          if(i < 2) await new Promise(r => setTimeout(r, 600 * (i + 1)));
+        }
+      }
+      throw lastErr;
     },
     async delete(key, shared){
       const res = await apiFetch(`/api/storage/${encodeURIComponent(key)}?shared=${!!shared}`, { method: 'DELETE' });
@@ -1588,6 +1611,7 @@ footer a{color:var(--gold);}
       return res.json();
     }
   };
+
 
   // Bootstrap: if a token already exists, verify it before letting the
   // app's storage calls through; otherwise show the login screen.
