@@ -1,4 +1,4 @@
-const supabase = require('../_lib/supabase');
+const db = require('../_lib/supabase');
 const { requireAuth } = require('../_lib/auth');
 
 module.exports = async function handler(req, res) {
@@ -18,23 +18,18 @@ module.exports = async function handler(req, res) {
   const prefix = req.query.prefix || '';
   const shared = String(req.query.shared).toLowerCase() === 'true';
 
-  let query = supabase.from('storage').select('key');
+  try {
+    const filter = { shared };
+    if (!shared) filter.user_id = userId;
 
-  if (shared) {
-    query = query.eq('shared', true);
-  } else {
-    query = query.eq('shared', false).eq('user_id', userId);
+    let rows = await db.select('storage', filter);
+    if (prefix) {
+      rows = rows.filter(r => String(r.key || '').startsWith(prefix));
+    }
+
+    return res.json({ keys: (rows || []).map(r => r.key), prefix, shared });
+  } catch (err) {
+    console.error('Storage list error:', err.message);
+    return res.status(500).json({ error: 'Storage list failed: ' + err.message });
   }
-
-  if (prefix) {
-    query = query.like('key', `${prefix}%`);
-  }
-
-  const { data: rows, error } = await query;
-
-  if (error) {
-    return res.status(500).json({ error: 'Storage list failed' });
-  }
-
-  return res.json({ keys: (rows || []).map(r => r.key), prefix, shared });
 };

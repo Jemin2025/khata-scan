@@ -1,35 +1,50 @@
-function cleanUrl(raw) {
-  if (!raw) return '';
-  try {
-    const u = new URL(raw.trim());
-    return u.origin;
-  } catch (e) {
-    return raw.trim().replace(/\/+$/, '');
-  }
+// Instant Cloud JSON Store — 0-config, 0-SQL, 100% persistent backend
+const BLOB_URL = process.env.JSON_BLOB_URL || 'https://jsonblob.com/api/jsonBlob/019f8f39-4b3d-7db7-9ef8-527dc603a4a8';
+
+// Lock helper to prevent race conditions during concurrent updates
+let lockPromise = Promise.resolve();
+
+function withLock(fn) {
+  const next = lockPromise.then(fn, fn);
+  lockPromise = next;
+  return next;
 }
 
-const SUPABASE_URL = cleanUrl(process.env.SUPABASE_URL);
-const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_KEY || '').trim();
+async function getFullDb() {
+  const res = await fetch(BLOB_URL, {
+    headers: { 'Accept': 'application/json' }
+  });
+  if (!res.ok) throw new Error(`Cloud DB fetch failed: ${res.status}`);
+  const data = await res.json();
+  if (!data.users) data.users = [];
+  if (!data.storage) data.storage = [];
+  return data;
+}
 
-function getHeaders() {
-  return {
-    'apikey': SUPABASE_KEY,
-    'Authorization': `Bearer ${SUPABASE_KEY}`,
-    'Content-Type': 'application/json',
-    'Prefer': 'return=representation'
-  };
+async function saveFullDb(data) {
+  const res = await fetch(BLOB_URL, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify(data)
+  });
+  if (!res.ok) throw new Error(`Cloud DB save failed: ${res.status}`);
+  return true;
 }
 
 const db = {
-  // SELECT — returns array of rows
+  // SELECT rows from table matching filters
   async select(table, filters = {}) {
-    let url = `${SUPABASE_URL}/rest/v1/${table}?select=*`;
-    for (const [key, val] of Object.entries(filters)) {
-      url += `&${key}=eq.${encodeURIComponent(val)}`;
-    }
-    const res = await fetch(url, { headers: getHeaders() });
-    if (!res.ok) throw new Error(`Supabase select failed: ${await res.text()}`);
-    return res.json();
+    const fullDb = await getFullDb();
+    const list = fullDb[table] || [];
+    return list.filter(row => {
+      for (const [k, v] of Object.entries(filters)) {
+        if (String(row[k]) !== String(v)) return false;
+      }
+      return true;
+    });
   },
 
   // SELECT single row
@@ -38,43 +53,58 @@ const db = {
     return rows[0] || null;
   },
 
-  // INSERT — returns inserted row
-  async insert(table, data) {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
-      method: 'POST',
-      headers: getHeaders(),
-      body: JSON.stringify(data)
+  // INSERT row into table
+  async insert(table, rowData) {
+    return withLock(async () => {
+      const fullDb = await getFullDb();
+      if (!fullDb[table]) fullDb[table] = [];
+      
+      const newRow = { id: Date.now(), ...rowData };
+      fullDb[table].push(newRow);
+      await saveFullDb(fullDb);
+      return newRow;
     });
-    if (!res.ok) throw new Error(`Supabase insert failed: ${await res.text()}`);
-    const rows = await res.json();
-    return rows[0] || rows;
   },
 
-  // UPSERT — insert or update
-  async upsert(table, data, onConflict) {
-    let url = `${SUPABASE_URL}/rest/v1/${table}`;
-    if (onConflict) url += `?on_conflict=${encodeURIComponent(onConflict)}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { ...getHeaders(), 'Prefer': 'return=representation,resolution=merge-duplicates' },
-      body: JSON.stringify(data)
+  // UPSERT row
+  async upsert(table, rowData, matchKeys = ['user_id', 'key', 'shared']) {
+    return withLock(async () => {
+      const fullDb = await getFullDb();
+      if (!fullDb[table]) fullDb[table] = [];
+
+      const list = fullDb[table];
+      const index = list.findIndex(r => {
+        return matchKeys.every(k => String(r[k] ?? '') === String(rowData[k] ?? ''));
+      });
+
+      if (index >= 0) {
+        list[index] = { ...list[index], ...rowData, updated_at: new Date().toISOString() };
+        await saveFullDb(fullDb);
+        return list[index];
+      } else {
+        const newRow = { id: Date.now(), ...rowData, updated_at: new Date().toISOString() };
+        list.push(newRow);
+        await saveFullDb(fullDb);
+        return newRow;
+      }
     });
-    if (!res.ok) throw new Error(`Supabase upsert failed: ${await res.text()}`);
-    return res.json();
   },
 
-  // DELETE
+  // DELETE rows matching filters
   async delete(table, filters = {}) {
-    let url = `${SUPABASE_URL}/rest/v1/${table}?`;
-    for (const [key, val] of Object.entries(filters)) {
-      url += `${key}=eq.${encodeURIComponent(val)}&`;
-    }
-    const res = await fetch(url, {
-      method: 'DELETE',
-      headers: getHeaders()
+    return withLock(async () => {
+      const fullDb = await getFullDb();
+      if (!fullDb[table]) return true;
+
+      fullDb[table] = fullDb[table].filter(row => {
+        for (const [k, v] of Object.entries(filters)) {
+          if (String(row[k]) === String(v)) return false;
+        }
+        return true;
+      });
+      await saveFullDb(fullDb);
+      return true;
     });
-    if (!res.ok) throw new Error(`Supabase delete failed: ${await res.text()}`);
-    return true;
   }
 };
 

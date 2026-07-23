@@ -1,17 +1,5 @@
 const { requireAuth } = require('../../_lib/auth');
-
-function cleanUrl(raw) {
-  if (!raw) return '';
-  try {
-    const u = new URL(raw.trim());
-    return u.origin;
-  } catch (e) {
-    return raw.trim().replace(/\/+$/, '');
-  }
-}
-
-const SUPABASE_URL = cleanUrl(process.env.SUPABASE_URL);
-const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_KEY || '').trim();
+const db = require('../../_lib/supabase');
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -33,19 +21,11 @@ module.exports = async function handler(req, res) {
   try {
     // ── GET ───────────────────────────────────────────────────────────────
     if (req.method === 'GET') {
-      let url = `${SUPABASE_URL}/rest/v1/storage?key=eq.${encodeURIComponent(key)}&shared=eq.${shared}`;
-      if (!shared) url += `&user_id=eq.${userId}`;
-      url += '&limit=1';
+      const filter = { key, shared };
+      if (!shared) filter.user_id = userId;
 
-      const res2 = await fetch(url, {
-        headers: {
-          'apikey': SUPABASE_KEY,
-          'Authorization': `Bearer ${SUPABASE_KEY}`
-        }
-      });
-      const rows = await res2.json();
-      if (!rows || rows.length === 0) return res.status(404).json({ error: 'Key not found' });
-      const row = rows[0];
+      const row = await db.selectOne('storage', filter);
+      if (!row) return res.status(404).json({ error: 'Key not found' });
       return res.json({ key: row.key, value: row.value, shared: row.shared });
     }
 
@@ -61,50 +41,25 @@ module.exports = async function handler(req, res) {
         return res.status(400).json({ error: 'Value too large (max 5MB)' });
       }
 
-      const data = {
+      const rowData = {
         key,
         shared: isShared,
         value,
-        user_id: isShared ? null : userId,
-        updated_at: new Date().toISOString()
+        user_id: isShared ? null : userId
       };
 
-      const onConflict = isShared ? 'key,shared' : 'user_id,key,shared';
-      const upsertUrl = `${SUPABASE_URL}/rest/v1/storage?on_conflict=${encodeURIComponent(onConflict)}`;
+      const matchKeys = isShared ? ['key', 'shared'] : ['user_id', 'key', 'shared'];
+      const saved = await db.upsert('storage', rowData, matchKeys);
 
-      const r = await fetch(upsertUrl, {
-        method: 'POST',
-        headers: {
-          'apikey': SUPABASE_KEY,
-          'Authorization': `Bearer ${SUPABASE_KEY}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'return=representation,resolution=merge-duplicates'
-        },
-        body: JSON.stringify(data)
-      });
-
-      if (!r.ok) {
-        const errText = await r.text();
-        console.error('Storage upsert error:', errText);
-        return res.status(500).json({ error: 'Storage save failed: ' + errText });
-      }
-
-      return res.json({ key, value, shared: isShared });
+      return res.json({ key: saved.key, value: saved.value, shared: saved.shared });
     }
 
     // ── DELETE ────────────────────────────────────────────────────────────
     if (req.method === 'DELETE') {
-      let url = `${SUPABASE_URL}/rest/v1/storage?key=eq.${encodeURIComponent(key)}&shared=eq.${shared}`;
-      if (!shared) url += `&user_id=eq.${userId}`;
+      const filter = { key, shared };
+      if (!shared) filter.user_id = userId;
 
-      await fetch(url, {
-        method: 'DELETE',
-        headers: {
-          'apikey': SUPABASE_KEY,
-          'Authorization': `Bearer ${SUPABASE_KEY}`
-        }
-      });
-
+      await db.delete('storage', filter);
       return res.json({ key, deleted: true, shared });
     }
 
