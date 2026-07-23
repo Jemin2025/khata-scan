@@ -2079,27 +2079,49 @@ document.getElementById('chequeFields').style.display = 'none';
 // ---------- Storage ----------
 async function loadLedger(){
   const syncEl = document.getElementById('syncStatus');
-  if(syncEl) syncEl.textContent = '🔄 Sync ho raha hai...';
+  if(syncEl) syncEl.textContent = '🔄 Loading...';
   try{
     const res = await window.storage.get(STORAGE_KEY, false);
     ledger = res && res.value ? JSON.parse(res.value) : [];
-    if(syncEl) { syncEl.textContent = '✅ Sync ho gaya'; setTimeout(()=>{ syncEl.textContent=''; },2000); }
+    if(syncEl) { syncEl.textContent = '✅ Synced'; setTimeout(()=>{ syncEl.textContent=''; }, 2500); }
   } catch(e){
-    ledger = [];
-    if(syncEl) syncEl.textContent = '⚠️ Offline';
+    // DO NOT reset ledger to [] on error — keep whatever was in memory
+    if(syncEl) syncEl.textContent = '⚠️ Server se connect nahi hua';
+    console.warn('loadLedger failed:', e.message);
   }
   renderLedger();
   renderHome();
 }
 
+// Retry helper — tries fn up to maxRetries times with delay
+async function retryAsync(fn, maxRetries = 3, delayMs = 800){
+  for(let i = 0; i < maxRetries; i++){
+    try{
+      return await fn();
+    } catch(e){
+      if(i < maxRetries - 1){
+        await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
 async function persistLedger(){
+  const syncEl = document.getElementById('syncStatus');
+  if(syncEl) syncEl.textContent = '💾 Save ho raha hai...';
   try{
-    await window.storage.set(STORAGE_KEY, JSON.stringify(ledger), false);
-    // After saving, re-fetch from server to confirm save succeeded
-    const res = await window.storage.get(STORAGE_KEY, false);
-    ledger = res && res.value ? JSON.parse(res.value) : ledger;
+    // Retry save up to 3 times — DO NOT re-fetch after save (causes data loss on slow networks)
+    await retryAsync(() => window.storage.set(STORAGE_KEY, JSON.stringify(ledger), false));
+    if(syncEl) { syncEl.textContent = '✅ Save ho gaya!'; setTimeout(()=>{ syncEl.textContent=''; }, 2500); }
   } catch(e){
-    console.error('Storage save failed', e);
+    console.error('Storage save failed after retries:', e);
+    if(syncEl) syncEl.textContent = '❌ Save fail! Dobara try karo';
+    // Show visible alert so user knows
+    const errMsg = 'Data save nahi hua! Internet check karo aur dobara save karo.';
+    setStatus(errMsg, 'error');
+    throw e; // Re-throw so callers know save failed
   }
   renderLedger();
   renderHome();
@@ -2155,27 +2177,41 @@ document.getElementById('btnSave').onclick = async () => {
     bank_account: paymentMethod === 'cheque' ? document.getElementById('fBankAccount').value.trim() : '',
     cheque_date: paymentMethod === 'cheque' ? document.getElementById('fChequeDate').value.trim() : '',
   };
-  ledger.unshift(record);
-  await persistLedger();
-  renderLedger();
-  if(typeof window.syncInvoiceToBillRegister === 'function'){
-    window.syncInvoiceToBillRegister(record);
-  }
 
-  // reset upload state
-  document.getElementById('extractedCard').style.display = 'none';
-  document.getElementById('previewBox').innerHTML = '';
-  document.getElementById('dropZone').classList.remove('has-file');
-  document.getElementById('btnExtract').disabled = true;
-  document.getElementById('fPaymentMethod').value = 'cash';
-  document.getElementById('chequeFields').style.display = 'none';
-  document.getElementById('fBankAccount').value = '';
-  document.getElementById('fChequeDate').value = '';
-  setStatus('Khate mein jud gaya ✓', 'ok');
-  currentFile = null;
-};
+  // Add to ledger first (local state)
+  ledger.unshift(record);
+  renderLedger(); // show immediately in UI
+
+  try {
+    // Now save to server
+    await persistLedger();
+
+    // Sync to bills register
+    if(typeof window.syncInvoiceToBillRegister === 'function'){
+      window.syncInvoiceToBillRegister(record);
+    }
+
+    // Only reset form AFTER successful save
+    document.getElementById('extractedCard').style.display = 'none';
+    document.getElementById('previewBox').innerHTML = '';
+    document.getElementById('dropZone').classList.remove('has-file');
+    document.getElementById('btnExtract').disabled = true;
+    document.getElementById('fPaymentMethod').value = 'cash';
+    document.getElementById('chequeFields').style.display = 'none';
+    document.getElementById('fBankAccount').value = '';
+    document.getElementById('fChequeDate').value = '';
+    currentFile = null;
+    setStatus('Khate mein jud gaya ✓', 'ok');
+  } catch(e) {
+    // Save failed — remove the record we added locally
+    ledger = ledger.filter(r => r.id !== record.id);
+    renderLedger();
+    // Keep form open so user can retry
+  }
+}; // end btnSave.onclick
 
 async function deleteRecord(id){
+
   ledger = ledger.filter(r => r.id !== id);
   await persistLedger();
   renderLedger();
@@ -2366,7 +2402,8 @@ async function loadIncoming(){
     const res = await window.storage.get('incoming-data', false);
     incoming = res && res.value ? JSON.parse(res.value) : [];
   } catch(e){
-    incoming = [];
+    // Keep existing data on error
+    console.warn('loadIncoming failed:', e.message);
   }
   renderIncoming();
   renderHome();
@@ -2374,9 +2411,9 @@ async function loadIncoming(){
 
 async function persistIncoming(){
   try{
-    await window.storage.set('incoming-data', JSON.stringify(incoming), false);
+    await retryAsync(() => window.storage.set('incoming-data', JSON.stringify(incoming), false));
   } catch(e){
-    console.error('Incoming storage save failed', e);
+    console.error('Incoming storage save failed:', e);
   }
   renderHome();
 }
@@ -2519,7 +2556,8 @@ async function loadManualCheques(){
     const res = await window.storage.get('manual-cheque-data', false);
     manualCheques = res && res.value ? JSON.parse(res.value) : [];
   } catch(e){
-    manualCheques = [];
+    // Keep existing data on error
+    console.warn('loadManualCheques failed:', e.message);
   }
   renderChequeSchedule();
   renderIncoming();
@@ -2527,9 +2565,9 @@ async function loadManualCheques(){
 
 async function persistManualCheques(){
   try{
-    await window.storage.set('manual-cheque-data', JSON.stringify(manualCheques), false);
+    await retryAsync(() => window.storage.set('manual-cheque-data', JSON.stringify(manualCheques), false));
   } catch(e){
-    console.error('Manual cheque storage save failed', e);
+    console.error('Manual cheque storage save failed:', e);
   }
 }
 
@@ -2803,11 +2841,11 @@ document.getElementById('btnSsCancel').onclick = () => {
     try{
       const r = await window.storage.get('bills', false);
       bills = r && r.value ? JSON.parse(r.value) : {};
-    }catch(e){ bills = {}; }
+    }catch(e){ console.warn('bills load failed:', e.message); } // keep existing
     try{
       const r = await window.storage.get('orders', false);
       orders = r && r.value ? JSON.parse(r.value) : {};
-    }catch(e){ orders = {}; }
+    }catch(e){ console.warn('orders load failed:', e.message); } // keep existing
     renderBills();
     renderOrders();
     syncHomeData();
@@ -2815,13 +2853,13 @@ document.getElementById('btnSsCancel').onclick = () => {
   window.loadBillsOrders = loadBillsOrders; // expose globally for sync button
 
   async function saveBills(){
-    try{ await window.storage.set('bills', JSON.stringify(bills), false); }
-    catch(e){ console.error('bill save error', e); }
+    try{ await retryAsync(() => window.storage.set('bills', JSON.stringify(bills), false)); }
+    catch(e){ console.error('bill save error:', e); }
     syncHomeData();
   }
   async function saveOrders(){
-    try{ await window.storage.set('orders', JSON.stringify(orders), false); }
-    catch(e){ console.error('order save error', e); }
+    try{ await retryAsync(() => window.storage.set('orders', JSON.stringify(orders), false)); }
+    catch(e){ console.error('order save error:', e); }
     syncHomeData();
   }
 
